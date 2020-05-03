@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import seaborn as sns
 from scipy.optimize import curve_fit
+from scipy import stats
 from plotting import timeseries, bar
 
 pd.options.display.expand_frame_repr = False
@@ -14,6 +15,7 @@ TIME_TO_TEST = 8  # days, assuming 5 day incubation and aggressive-ish testing c
 
 CASE_DF = pd.read_csv('case_data/covid_19_clean_complete.csv').drop(columns=['Lat', 'Long'])
 CONF_DF = pd.read_csv('case_data/time_series_covid19_confirmed_global.csv').drop(columns=['Lat', 'Long'])
+CONF_DF_NO_CHINA = CONF_DF[CONF_DF['Country/Region'] != 'China']
 TMAX_DF = pd.read_csv('weather_data/tMax.csv').drop(columns=['Lat', 'Long'])
 HUMID_DF = pd.read_csv('weather_data/humidity.csv').drop(columns=['Lat', 'Long'])
 
@@ -21,7 +23,7 @@ HUMID_DF = pd.read_csv('weather_data/humidity.csv').drop(columns=['Lat', 'Long']
 def order_regions_by_total_cases(resolution='local', n=20):
     col = 'Country/Region' if resolution == 'countries' else 'Province/State'
     col_to_drop = 'Country/Region' if resolution == 'local' else 'Province/State'
-    df = CONF_DF.drop(columns=[col_to_drop])
+    df = CONF_DF_NO_CHINA.drop(columns=[col_to_drop])
     country_df = df.groupby(col).sum()
     regions = country_df.iloc[:, -1].sort_values(ascending=False).head(n)
     print(regions)
@@ -36,7 +38,7 @@ def fit_exp_func(data, exp_range=None, threshold=10, plot=True, verbose=False):
         exp_range: tuple of month strings to bound fitted function
         threshold: if no exp_range is supplied it will be bounded this threshold
          and the max value of the data
-        plot: plot
+        plot: plot or pass in ax
         verbose: print stuff if True
 
     Returns: function params, error (from covariance), indices of exp region
@@ -63,34 +65,39 @@ def fit_exp_func(data, exp_range=None, threshold=10, plot=True, verbose=False):
         exp_curve.loc[:lims[1] + 1, 'exp'] = f(X_tot, *params)
         exp_curve.loc[:lims[1] + 1, '+1sd'] = f(X_tot, params[0], params[1] + err[1])
         exp_curve.loc[:lims[1] + 1, '-1sd'] = f(X_tot, params[0], params[1] - err[1])
-        fig, ax = plt.subplots(1, 1, sharex=True, figsize=(14, 8))
+        if isinstance(plot, bool):
+            fig, ax = plt.subplots(1, 1, sharex=True, figsize=(14, 8))
+        else:
+            ax = plot
         data.plot(style='x', ax=ax)
         exp_curve['exp'].plot(ax=ax, colors='g')
         exp_curve.loc[:, ['+1sd', '-1sd']].plot(ax=ax, color=['r', 'r'])
         ax.set_title(f'Daily new cases for {data.name}')
-        fig.tight_layout()
-        plt.show()
+        if isinstance(plot, bool):
+            fig.tight_layout()
+            plt.show()
 
     return params, err, exp_range
 
 
-def exp_study(resolution='local'):
+def exp_study(resolution='local', n=30):
     # test_thresholds = np.arange(10, 110, 10)
     test_thresholds = np.arange(5, 21, 1)
     # test_thresholds = [10]
-    df, regions = order_regions_by_total_cases(resolution=resolution, n=50)
+    df, regions = order_regions_by_total_cases(resolution=resolution, n=n)
     if resolution == 'countries':
         regions.remove('China')  # exponential part of pandemic was earlier than these records go
         regions.remove('Iran')  # extremely weird
-        regions.remove('Norway')  # single testing outlier and lack of overall cases makes exp function fail
-        regions.remove('Qatar')  # crazy outlier
-        regions.remove('Diamond Princess')  # not a region
-        regions.remove('Estonia')  # negative fit
-        regions.remove('Slovenia')  # negative fit
-        print(df.head())
+        # regions.remove('Norway')  # single testing outlier and lack of overall cases makes exp function fail
+        # regions.remove('Qatar')  # crazy outlier
+        # regions.remove('Estonia')  # negative fit
+        # regions.remove('Slovenia')  # negative fit
+        # regions.remove('Uruguay')  # negative fit
+        # print(df.head())
     else:
-        print(df)
-    # raise
+        pass
+        # regions.remove('Grand Princess')  # not a region
+    # regions.remove('Diamond Princess')  # not a region
 
     exp_coeffs, errs, exp_range_low, exp_range_high = {}, {}, {}, {}
     B_df = pd.DataFrame(index=regions, columns=test_thresholds)
@@ -98,7 +105,10 @@ def exp_study(resolution='local'):
         for region in regions:
             daily_new_cases = df[df.index == region].squeeze().diff()
             # print(daily_new_cases)
-            params, err, exp_range = fit_exp_func(daily_new_cases, threshold=thresh, plot=False)
+            try:
+                params, err, exp_range = fit_exp_func(daily_new_cases, threshold=thresh, plot=False)
+            except:
+                continue  # can't fit exp function
             exp_coeffs[region] = params[1]
             errs[region] = err[1]
             exp_range_low[region], exp_range_high[region] = exp_range
@@ -116,7 +126,7 @@ def exp_study(resolution='local'):
     std_thresh = 0.05  # choose a reasonable number
     B_df = sorted_by_std[sorted_by_std['std'] < std_thresh]
     B_df = B_df.sort_values(by='avg')
-    print(B_df)
+    # print(B_df)
 
     # get the threshold value that produced the median B
     best_low_thresh_dict = {}
@@ -145,31 +155,101 @@ def exp_study(resolution='local'):
     return best_params_df
 
 
-def temp_study(resolution='local'):
-    exp_params_df = exp_study(resolution=resolution)
-    avg_tmax, avg_humidity = [], []
+def weather_study(resolution='countries', features=None, n=30):
+    exp_params_df = exp_study(resolution=resolution, n=n)
+    weather_features = ['tMax', 'humidity'] if features is None else features
+    avg_weather_features = {wf: [] for wf in weather_features}
     for region, row in exp_params_df.iterrows():
-        col = 'Country/Region' if resolution == 'countries' else 'Preqer'
-        tmax = TMAX_DF.loc[TMAX_DF[col] == region].squeeze()
-        humidity = HUMID_DF.loc[HUMID_DF[col] == region].squeeze()
-        if type(tmax) == pd.DataFrame:
-            tmax = tmax.mean(axis=0)  # average over local
-        if type(humidity) == pd.DataFrame:
-            humidity = humidity.mean(axis=0)  # average over local
+        col = 'Country/Region' if resolution == 'countries' else 'Province/State'
+        for wf in weather_features:
+            df = pd.read_csv(f'weather_data/{wf}.csv').drop(columns=['Lat', 'Long'])
+            data = df.loc[df[col] == region].squeeze()
+            if type(data) == pd.DataFrame:
+                data = data.median(axis=0)  # average over local
 
-        # lag weather by onset time to test
-        low_i = tmax.index.get_loc(row['Exp range low']) - TIME_TO_TEST
-        high_i = tmax.index.get_loc(row['Exp range high']) - TIME_TO_TEST
-        avg_tmax.append(tmax.iloc[low_i:high_i].mean())
-        avg_humidity.append(humidity.iloc[low_i:high_i].mean())
+            # lag weather by onset time to test
+            low_i = data.index.get_loc(row['Exp range low']) - TIME_TO_TEST
+            high_i = data.index.get_loc(row['Exp range high']) - TIME_TO_TEST
+            avg_weather_features[wf].append(data.iloc[low_i:high_i].mean())
 
-    exp_params_df['Avg tMax'] = avg_tmax
-    exp_params_df['Avg humidity'] = avg_humidity
-    print(exp_params_df.sort_values(by='B'))
-    sns.lmplot(x='Avg tMax', y='B', data=exp_params_df, fit_reg=True)
-    sns.lmplot(x='Avg humidity', y='B', data=exp_params_df, fit_reg=True)
+    fig, axes = plt.subplots(1, len(weather_features), sharey=True,
+                             figsize=(6 * len(weather_features), 6))
+    for i, wf in enumerate(weather_features):
+        display = exp_params_df.copy()
+        display[wf] = avg_weather_features[wf]
+        print(display.sort_values(by=wf))
+        m, c, r, p, std_err = stats.linregress(display[wf], display['B'])
+        sns.regplot(x=wf, y='B', data=display, fit_reg=True,
+                    line_kws={'label': f'R Value: {r:.2f}'}, ax=axes[i])
+        axes[i].set_ylim(bottom=0)
+        axes[i].legend()
+    fig.suptitle(
+        f'The effect of weather on exponential coefficient of daily new cases (top {n} countries)')
+    # fig.tight_layout()
     plt.show()
 
 
+def weather_study_within_regions(features=None, n=1):
+    fig, axes = plt.subplots(2, 1, sharex=False, figsize=(10, 8))
+    df, regions = order_regions_by_total_cases(resolution='countries', n=1)
+    # print(df)
+    country = 'Italy'
+    daily_new_cases = df[df.index == country].squeeze().diff()
+    params, err, exp_range = fit_exp_func(daily_new_cases, threshold=8, plot=False)
+    print(exp_range)
+
+    low_i = daily_new_cases.index.get_loc(exp_range[0])
+    high_i = daily_new_cases.index.get_loc(exp_range[1])
+    pct_change = daily_new_cases.pct_change()
+    normalized_pct_changes = pct_change.iloc[low_i:high_i].reset_index(drop=True)
+
+    wf = 'tMax'
+    weather_df = pd.read_csv(f'weather_data/{wf}.csv').drop(columns=['Lat', 'Long'])
+    tmax = weather_df[weather_df['Country/Region'] == country].squeeze()
+    low_i = tmax.index.get_loc(exp_range[0]) - TIME_TO_TEST
+    high_i = tmax.index.get_loc(exp_range[1]) - TIME_TO_TEST
+    normalized_tmax = tmax.iloc[low_i:high_i].reset_index(drop=True).astype(float)
+
+    normalized_pct_changes.plot(ax=axes[0])
+    axes[0].lines[-1].set_label(f'tMax {TIME_TO_TEST} days before')
+    axes[0].set_title(f'% change in daily cases and tMax {TIME_TO_TEST} days before for {country}')
+    ax2 = axes[0].twinx()
+    normalized_tmax.plot(ax=ax2, color='m')
+    axes[0].set_ylabel('%')
+    ax2.lines[-1].set_label('Daily change in new cases')
+    ax2.set_ylabel('C')
+    axes[0].set_xlabel('Days')
+    axes[0].legend(loc='upper left')
+    ax2.legend(loc='upper right')
+
+    # print(type(normalized_tmax))
+    # print(type(normalized_pct_changes))
+
+    combined = pd.concat([normalized_tmax, normalized_pct_changes], axis=1)
+    combined = combined.replace([np.inf, np.nan], 1)
+    # print(combined.iloc[:, 0])
+    m, c, r, p, std_err = stats.linregress(combined.iloc[:, 0], combined.iloc[:, 1])
+    print(combined)
+    sns.scatterplot(x=combined.columns[0], y=combined.columns[1], data=combined, ax=axes[1])
+    x = combined.iloc[:, 0].values
+    print(m, c, r)
+    axes[1].plot(x, m*x + c, 'r', label=f'R Value: {r:.2f}')
+    axes[1].legend()
+    axes[1].set_title(f'{wf} vs % change in daily new cases')
+    axes[1].set_ylabel('Daily change in new cases (%)')
+    axes[1].set_xlabel(f'tMax {TIME_TO_TEST} days before (C)')
+    fig.tight_layout()
+    plt.show()
+
+
+
+
+
+
 if __name__ == '__main__':
-    temp_study(resolution='countries')
+    all_weather_features = ['cloud', 'dew', 'ozone', 'precip', 'pressure', 'tMax', 'tMin', 'uv',
+                            'wind', 'humidity']
+    features = ['tMax', 'humidity']
+    # weather_study(n=30, features=features)
+    weather_study_within_regions()
+
